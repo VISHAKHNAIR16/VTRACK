@@ -10,13 +10,13 @@ from typing import Dict, Any, List, Optional
 import re
 from datetime import datetime
 import warnings
-import textwrap
+import re
 
 warnings.filterwarnings('ignore')
 
 # Set page configuration
 st.set_page_config(
-    page_title="Travel Data Formatter",
+    page_title="VTRACK -- By Vayoaura",
     page_icon="📋",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -343,6 +343,34 @@ def clean_phone_number(phone: str) -> str:
     
     return phone_str
 
+
+def get_pickup_time_for_sorting(record: Dict[str, Any]) -> str:
+    """Extract pickup time for sorting purposes."""
+    if record['type'] == 'individual':
+        # For individual cards
+        pickup_time = record['data'].get('PickupTime', '')
+        if pd.isna(pickup_time) or not pickup_time:
+            return "99:99"  # Put at the end if no time
+        # Convert to proper HH:MM format
+        time_str = str(pickup_time).strip()
+        if ':' in time_str:
+            parts = time_str.split(':')
+            hours = parts[0].zfill(2)
+            minutes = parts[1][:2].zfill(2) if len(parts) > 1 else "00"
+            return f"{hours}:{minutes}"
+        elif len(time_str) == 4 and time_str.isdigit():
+            return f"{time_str[:2]}:{time_str[2:]}"
+        else:
+            return "99:99"
+    else:
+        # For shared groups, use the first passenger's pickup time
+        if record['passengers']:
+            pickup_time = record['passengers'][0].get('pickup_time', '')
+            if pickup_time:
+                return pickup_time
+        # Fallback to common pickup time
+        return record['common_data'].get('pickup_time', '99:99')
+
 def format_pax_count(adult: int, child: int, infant: int) -> str:
     """Format passenger count EXACTLY as per requirements."""
     adult = int(adult) if pd.notna(adult) else 0
@@ -352,11 +380,11 @@ def format_pax_count(adult: int, child: int, infant: int) -> str:
     # Format exactly as in the example: "5PAX" or "4+2PAX" (no spaces before PAX)
     if child > 0 or infant > 0:
         if child > 0 and infant > 0:
-            return f"{adult}+{child}+{infant}PAX"
+            return f"{adult}+{child}+{infant} PAX"
         elif child > 0:
-            return f"{adult}+{child}PAX"
+            return f"{adult}+{child} PAX"
         elif infant > 0:
-            return f"{adult}+{infant}PAX"
+            return f"{adult}+{infant} PAX"
     return f"{adult} PAX"
 
 def format_date(date_val: Any) -> str:
@@ -429,7 +457,7 @@ def group_shared_services(df: pd.DataFrame) -> List[Dict[str, Any]]:
     """
     grouped_records = []
     
-    # Make a copy
+    # Make a copy - preserve original order
     temp_df = df.copy()
     
     # Clean and standardize time format
@@ -466,12 +494,13 @@ def group_shared_services(df: pd.DataFrame) -> List[Dict[str, Any]]:
     tour_df = temp_df[is_tour].copy()
     non_tour_df = temp_df[~is_tour]
     
-    # Process non-tour rows as individual
-    for _, row in non_tour_df.iterrows():
+    # Process non-tour rows as individual - in original order
+    for index, row in non_tour_df.iterrows():
         grouped_records.append({
             'type': 'individual',
             'data': row.to_dict(),
-            'row_index': row.name if hasattr(row, 'name') else _
+            'row_index': index,
+            'sort_index': index  # Preserve original sort order
         })
     
     # STEP 2: Process tours
@@ -481,12 +510,13 @@ def group_shared_services(df: pd.DataFrame) -> List[Dict[str, Any]]:
         sharing_tours = tour_df[sharing_mask]
         private_tours = tour_df[~sharing_mask]
         
-        # Process PRIVATE tours as individual
-        for _, row in private_tours.iterrows():
+        # Process PRIVATE tours as individual - in original order
+        for index, row in private_tours.iterrows():
             grouped_records.append({
                 'type': 'individual',
                 'data': row.to_dict(),
-                'row_index': row.name
+                'row_index': index,
+                'sort_index': index  # Preserve original sort order
             })
         
         # STEP 3: SMART GROUPING for SHARING tours
@@ -508,6 +538,9 @@ def group_shared_services(df: pd.DataFrame) -> List[Dict[str, Any]]:
             processed_indices = set()
             
             for vehicle_key, vehicle_group in sharing_tours.groupby('VehicleGroupKey'):
+                # Sort vehicle group by original index to preserve order
+                vehicle_group = vehicle_group.sort_index()
+                
                 # Check if this vehicle has valid info
                 first_row = vehicle_group.iloc[0]
                 has_vehicle_info = (
@@ -533,6 +566,9 @@ def group_shared_services(df: pd.DataFrame) -> List[Dict[str, Any]]:
             remaining = sharing_tours[~sharing_tours.index.isin(processed_indices)]
             
             if not remaining.empty:
+                # Sort remaining by original index
+                remaining = remaining.sort_index()
+                
                 # Group by date and similar time window
                 remaining['TimeGroupKey'] = remaining.apply(
                     lambda x: (
@@ -546,6 +582,9 @@ def group_shared_services(df: pd.DataFrame) -> List[Dict[str, Any]]:
                 )
                 
                 for time_key, time_group in remaining.groupby('TimeGroupKey'):
+                    # Sort time group by original index
+                    time_group = time_group.sort_index()
+                    
                     if len(time_group) > 1:
                         # Group by similar pickup time (within 30 minutes)
                         time_groups = group_by_time_window(time_group, time_window_minutes=30)
@@ -559,7 +598,8 @@ def group_shared_services(df: pd.DataFrame) -> List[Dict[str, Any]]:
                                 grouped_records.append({
                                     'type': 'individual',
                                     'data': row,
-                                    'row_index': row.name if hasattr(row, 'name') else None
+                                    'row_index': row.name if hasattr(row, 'name') else None,
+                                    'sort_index': row.name if hasattr(row, 'name') else None
                                 })
                     else:
                         # Single passenger
@@ -567,24 +607,40 @@ def group_shared_services(df: pd.DataFrame) -> List[Dict[str, Any]]:
                         grouped_records.append({
                             'type': 'individual',
                             'data': row.to_dict(),
-                            'row_index': row.name
+                            'row_index': row.name,
+                            'sort_index': row.name
                         })
     
+    # Finally, sort all records by their original index to maintain DataFrame order
+    grouped_records.sort(key=lambda x: x.get('sort_index', 999999))
+    
     return grouped_records
+
+
 
 def normalize_service_name(service_name: str) -> str:
     """Normalize service name for grouping (remove variations)."""
     if not service_name:
         return ""
     
-    service = str(service_name).upper()
+    service = str(service_name)
     
     # Remove common prefixes/suffixes
     service = re.sub(r'^\s*(NO\s+KIDDING\s*)?', '', service, flags=re.IGNORECASE)
-    service = re.sub(r'\s*(XRQT|TOUR|PACKAGE|WITH\s+LUNCH).*$', '', service, flags=re.IGNORECASE)
+    service = re.sub(r'\s*(TOUR|PACKAGE|WITH\s+LUNCH).*$', '', service, flags=re.IGNORECASE)
     
-    # Keep only alphanumeric characters
-    service = re.sub(r'[^A-Z0-9\s]', '', service)
+    # Remove XRQT specifically and clean up surrounding text
+    # This handles cases like "SERVICE XRQT", "XRQT SERVICE", "SERVICE-XRQT", etc.
+    service = re.sub(r'\s*XRQT\s*', ' ', service, flags=re.IGNORECASE)
+    
+    # Clean up any extra spaces created by removing XRQT
+    service = re.sub(r'\s+', ' ', service)
+    
+    # Remove any trailing "WITH" that might be left after removing XRQT
+    service = re.sub(r'\s+WITH$', '', service, flags=re.IGNORECASE)
+    
+    # Keep only alphanumeric characters and spaces
+    service = re.sub(r'[^A-Za-z0-9\s]', '', service)
     
     return service.strip()
 
@@ -637,6 +693,9 @@ def process_sharing_group(group_df, grouped_records):
     """Helper function to process a sharing group."""
     group_passengers = []
     
+    # Use the minimum index from the group for sorting
+    group_min_index = group_df.index.min()
+    
     for _, row in group_df.iterrows():
         row_dict = row.to_dict()
         
@@ -659,7 +718,29 @@ def process_sharing_group(group_df, grouped_records):
         }
         group_passengers.append(passenger_info)
     
-    # Get common data from first row in group
+    # Get common data - try to find ANY row with vehicle/driver info
+    vehicle_name = ""
+    driver_name = ""
+    driver_number = ""
+    vehicle_number = ""
+    
+    # Look through all rows to find vehicle/driver info
+    for _, row in group_df.iterrows():
+        temp_vehicle = str(row.get('VehicalName', '')).strip()
+        temp_driver = str(row.get('Driver Name', '')).strip()
+        temp_driver_num = str(row.get('Driver Number', '')).strip()
+        temp_vehicle_num = str(row.get('Vehicle Number', '')).strip()
+        
+        if temp_vehicle and temp_vehicle not in ['', '-', 'N/A']:
+            vehicle_name = temp_vehicle
+        if temp_driver and temp_driver not in ['', '-', 'N/A']:
+            driver_name = temp_driver
+        if temp_driver_num and temp_driver_num not in ['', '-', 'N/A']:
+            driver_number = temp_driver_num
+        if temp_vehicle_num and temp_vehicle_num not in ['', '-', 'N/A']:
+            vehicle_number = temp_vehicle_num
+    
+    # Get other common data from first row
     first_row = group_df.iloc[0]
     group_data = {
         'type': 'shared',
@@ -667,11 +748,12 @@ def process_sharing_group(group_df, grouped_records):
         'common_data': {
             'service_date': format_date(first_row.get('ServiceDate', '')),
             'service_type': str(first_row.get('ServiceType', '')).strip(),
-            'vehicle_name': str(first_row.get('VehicleName', '')).strip(),
-            'driver_name': str(first_row.get('Driver Name', '')).strip(),
-            'driver_number': str(first_row.get('Driver Number', '')).strip(),
-            'vehicle_number': str(first_row.get('Vehicle Number', '')).strip()
-        }
+            'vehicle_name': vehicle_name,
+            'driver_name': driver_name,
+            'driver_number': driver_number,
+            'vehicle_number': vehicle_number
+        },
+        'sort_index': group_min_index  # Use minimum index for sorting
     }
     grouped_records.append(group_data)
 
@@ -719,13 +801,13 @@ def create_shared_card_text(group_data: Dict[str, Any]) -> str:
         # Format PAX exactly as per requirements
         if child > 0 or infant > 0:
             if child > 0 and infant > 0:
-                pax_str = f"{adult}+{child}+{infant}PAX"
+                pax_str = f"{adult}+{child}+{infant} PAX"
             elif child > 0:
-                pax_str = f"{adult}+{child}PAX"
+                pax_str = f"{adult}+{child} PAX"
             elif infant > 0:
-                pax_str = f"{adult}+{infant}PAX"
+                pax_str = f"{adult}+{infant} PAX"
         else:
-            pax_str = f"{adult}PAX"
+            pax_str = f"{adult} PAX"
         
         lines.append(f"{passenger['guest_name']} -- {pax_str}")
         
@@ -763,7 +845,8 @@ def create_shared_card_text(group_data: Dict[str, Any]) -> str:
             service_name = common.get('service_name', '')
         
         if service_name:
-            # Clean service text
+            # Clean service text - REMOVE XRQT HERE
+            service_name = re.sub(r'\s*XRQT\s*', ' ', service_name, flags=re.IGNORECASE)
             service_name = re.sub(r'<[^>]+>', '', service_name)
             service_name = ' '.join(service_name.split())
             lines.append(f"Service Name : {service_name}")
@@ -809,12 +892,16 @@ def create_shared_card_text(group_data: Dict[str, Any]) -> str:
         lines.append(common['service_type'])
     
     # Driver and vehicle info (ONLY ONCE at the end)
+    # Only add these lines if we have at least SOME info
     # Vehicle name first
-    if common['vehicle_name'] and common['vehicle_name'].strip() not in ['', '-', 'N/A', 'UNKNOWN_VEHICLE']:
+    if common['vehicle_name'] and common['vehicle_name'].strip() not in ['', '-', 'N/A']:
         lines.append(common['vehicle_name'])
+    elif common['driver_name'] or common['driver_number'] or common['vehicle_number']:
+        # If we don't have vehicle name but have other info, add empty line for consistency
+        lines.append("")
     
     # Driver name
-    if common['driver_name'] and common['driver_name'].strip() not in ['', '-', 'N/A', 'UNKNOWN_DRIVER']:
+    if common['driver_name'] and common['driver_name'].strip() not in ['', '-', 'N/A']:
         lines.append(common['driver_name'])
     
     # Driver number
@@ -822,7 +909,7 @@ def create_shared_card_text(group_data: Dict[str, Any]) -> str:
         lines.append(common['driver_number'])
     
     # Vehicle number
-    if common['vehicle_number'] and common['vehicle_number'].strip() not in ['', '-', 'N/A', 'UNKNOWN_VEHICLE_NUM']:
+    if common['vehicle_number'] and common['vehicle_number'].strip() not in ['', '-', 'N/A']:
         lines.append(common['vehicle_number'])
     
     # Add divider
@@ -841,11 +928,13 @@ def create_card_text(row: Dict[str, Any]) -> str:
     alternate_no = clean_phone_number(row.get('AlternateNumber', ''))
     
     # Get service name - try TourOptionName first, then ServiceName
-    
     service_name = str(row.get('ServiceName', '')).strip()
     
-    service_text = service_name
+    # REMOVE XRQT from service name for display
+    service_name = re.sub(r'\s*XRQT\s*', ' ', service_name, flags=re.IGNORECASE)
+    service_name = re.sub(r'\s+', ' ', service_name)  # Clean extra spaces
     
+    service_text = service_name
     
     transfer_from = str(row.get('TransferFrom', '')).strip()
     transfer_to = str(row.get('TransferTo', '')).strip()
@@ -1089,7 +1178,7 @@ def process_excel_file(uploaded_file) -> Optional[pd.DataFrame]:
                 column_mapping[col] = 'PickupTime'
             elif 'flightno' in col_lower or 'flightNo' in col_lower:
                 column_mapping[col] = 'FlightNo'
-            elif 'vehicalname' in col_lower or 'vehiclename' in col_lower:
+            elif 'vehicalname' in col_lower or 'VehicalName' in col_lower:
                 column_mapping[col] = 'VehicalName'
             elif 'drivername' in col_lower:
                 column_mapping[col] = 'Driver Name'
@@ -1130,6 +1219,35 @@ def process_excel_file(uploaded_file) -> Optional[pd.DataFrame]:
         
         # Fill all NaN values with empty string
         df = df.fillna("")
+        
+        # SORT THE DATAFRAME BY PICKUP TIME BEFORE PROCESSING
+        # Create a function to convert time to sortable format
+        def time_to_sortable(t):
+            if pd.isna(t) or not t:
+                return "99:99"
+            time_str = str(t).strip()
+            # Handle various time formats
+            if ':' in time_str:
+                parts = time_str.split(':')
+                hours = parts[0].zfill(2)
+                minutes = parts[1][:2].zfill(2) if len(parts) > 1 else "00"
+                return f"{hours}:{minutes}"
+            elif len(time_str) == 4 and time_str.isdigit():
+                return f"{time_str[:2]}:{time_str[2:]}"
+            else:
+                return "99:99"
+        
+        # Add sortable time column
+        df['SortableTime'] = df['PickupTime'].apply(time_to_sortable)
+        
+        # Sort by date first, then by time
+        df['SortableDate'] = df['ServiceDate'].apply(lambda x: pd.to_datetime(x, errors='coerce') if x else pd.NaT)
+        
+        # Sort DataFrame by Date, then Time
+        df = df.sort_values(['SortableDate', 'SortableTime'])
+        
+        # Remove temporary columns
+        df = df.drop(columns=['SortableTime', 'SortableDate'])
         
         status_text.text("🎯 Finalizing...")
         progress_bar.progress(80)
@@ -1193,13 +1311,14 @@ def display_metrics(grouped_records: List[Dict[str, Any]]):
         else:
             total_passengers += len(record['passengers'])
     
-    col1, col2, col3, col4 = st.columns(4)
+    col2, col1, col3, col4 = st.columns(4)
     
-    with col1:
-        st.markdown(create_metric_card("Total Cards", total_cards, "📋"), unsafe_allow_html=True)
-    
+
     with col2:
         st.markdown(create_metric_card("Total Passengers", total_passengers, "👥"), unsafe_allow_html=True)
+
+    with col1:
+        st.markdown(create_metric_card("Total Cards", total_cards, "📋"), unsafe_allow_html=True)
     
     with col3:
         st.markdown(create_metric_card("Individual", individual_count, "🚗"), unsafe_allow_html=True)
@@ -1215,7 +1334,7 @@ def display_cards(formatted_cards: List[str], grouped_records: List[Dict[str, An
         return
     
     # Create tabs for different views
-    tab1, tab2 = st.tabs(["📋 Formatted Cards", "📊 Grouped Data Preview"])
+    tab1, tab2 = st.tabs(["📋 Formatted Cards", "📊 Original Data In Excel"])
     
     with tab1:
         # Display cards with copy buttons
@@ -1236,7 +1355,13 @@ def display_cards(formatted_cards: List[str], grouped_records: List[Dict[str, An
     
     with tab2:
         if st.session_state.df is not None:
-            # Show grouping information
+            # Show original data table
+            st.subheader("Original Data")
+            
+            # Display the entire DataFrame with all columns
+            st.dataframe(st.session_state.df, use_container_width=True)
+            
+            # Show grouping information below it
             st.subheader("Grouping Summary")
             
             group_info = []
@@ -1355,8 +1480,16 @@ def main():
                         
                         # NEW: Group shared services
                         grouped_records = group_shared_services(df)
-                        
-                        # Format cards based on type
+
+                        # SORT records by pickup time
+                        # First, add sorting key to each record
+                        for record in grouped_records:
+                            record['sort_key'] = get_pickup_time_for_sorting(record)
+
+                        # Sort grouped_records by pickup time
+                        grouped_records.sort(key=lambda x: x['sort_key'])
+
+                        # Format cards based on type (now in sorted order)
                         formatted_cards = []
                         for record in grouped_records:
                             if record['type'] == 'individual':
