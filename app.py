@@ -308,6 +308,8 @@ def initialize_session_state():
         st.session_state.df = None
     if 'formatted_cards' not in st.session_state:
         st.session_state.formatted_cards = []
+    if 'grouped_records' not in st.session_state:
+        st.session_state.grouped_records = []
     if 'original_columns' not in st.session_state:
         st.session_state.original_columns = []
     if 'processing_done' not in st.session_state:
@@ -420,6 +422,414 @@ def clean_flight_number(flight_no: str) -> str:
 
     return flight_str
 
+def group_shared_services(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """
+    Group passengers who share the same vehicle/driver for tours.
+    SMART GROUPING: Groups by vehicle/driver first, then checks for similarity.
+    """
+    grouped_records = []
+    
+    # Make a copy
+    temp_df = df.copy()
+    
+    # Clean and standardize time format
+    def clean_time(time_val):
+        if pd.isna(time_val):
+            return ""
+        time_str = str(time_val).strip()
+        # Remove seconds if present
+        if ':' in time_str:
+            parts = time_str.split(':')
+            if len(parts) >= 2:
+                return f"{parts[0].zfill(2)}:{parts[1][:2].zfill(2)}"
+        return time_str
+    
+    temp_df['CleanPickupTime'] = temp_df['PickupTime'].apply(clean_time)
+    
+    # Clean vehicle/driver info
+    def clean_vehicle_info(val):
+        if pd.isna(val):
+            return ""
+        return str(val).strip()
+    
+    temp_df['CleanVehicleName'] = temp_df['VehicalName'].apply(clean_vehicle_info)
+    temp_df['CleanDriverName'] = temp_df['Driver Name'].apply(clean_vehicle_info)
+    temp_df['CleanDriverNumber'] = temp_df['Driver Number'].apply(clean_vehicle_info)
+    temp_df['CleanVehicleNumber'] = temp_df['Vehicle Number'].apply(clean_vehicle_info)
+    
+    # STEP 1: Identify TOURS
+    is_tour = (
+        (temp_df['ProductType'].str.strip().str.upper() == 'TOUR') |
+        (temp_df['ServiceType'].str.strip().str.upper().str.contains('TOUR'))
+    )
+    
+    tour_df = temp_df[is_tour].copy()
+    non_tour_df = temp_df[~is_tour]
+    
+    # Process non-tour rows as individual
+    for _, row in non_tour_df.iterrows():
+        grouped_records.append({
+            'type': 'individual',
+            'data': row.to_dict(),
+            'row_index': row.name if hasattr(row, 'name') else _
+        })
+    
+    # STEP 2: Process tours
+    if not tour_df.empty:
+        # Separate SHARING and PRIVATE tours
+        sharing_mask = tour_df['ServiceType'].str.strip().str.upper() == 'SHARING'
+        sharing_tours = tour_df[sharing_mask]
+        private_tours = tour_df[~sharing_mask]
+        
+        # Process PRIVATE tours as individual
+        for _, row in private_tours.iterrows():
+            grouped_records.append({
+                'type': 'individual',
+                'data': row.to_dict(),
+                'row_index': row.name
+            })
+        
+        # STEP 3: SMART GROUPING for SHARING tours
+        if not sharing_tours.empty:
+            # First, try to group by VEHICLE/DRIVER info
+            # Create a vehicle group key
+            sharing_tours['VehicleGroupKey'] = sharing_tours.apply(
+                lambda x: (
+                    format_date(x.get('ServiceDate', '')),
+                    x['CleanVehicleName'],
+                    x['CleanDriverName'],
+                    x['CleanDriverNumber'],
+                    x['CleanVehicleNumber']
+                ),
+                axis=1
+            )
+            
+            # Process each vehicle group
+            processed_indices = set()
+            
+            for vehicle_key, vehicle_group in sharing_tours.groupby('VehicleGroupKey'):
+                # Check if this vehicle has valid info
+                first_row = vehicle_group.iloc[0]
+                has_vehicle_info = (
+                    first_row['CleanVehicleName'] not in ['', '-', 'N/A'] and
+                    first_row['CleanDriverName'] not in ['', '-', 'N/A']
+                )
+                
+                if has_vehicle_info and len(vehicle_group) > 1:
+                    # This vehicle has multiple passengers - group them
+                    process_sharing_group(vehicle_group, grouped_records)
+                    processed_indices.update(vehicle_group.index.tolist())
+                elif len(vehicle_group) == 1:
+                    # Single passenger with vehicle info - check for time-based grouping
+                    row = vehicle_group.iloc[0]
+                    # We'll handle this in the next step
+                    pass
+                else:
+                    # Multiple passengers but no vehicle info - need time/location grouping
+                    # We'll handle this in the next step
+                    pass
+            
+            # STEP 4: Group remaining passengers by TIME and SERVICE SIMILARITY
+            remaining = sharing_tours[~sharing_tours.index.isin(processed_indices)]
+            
+            if not remaining.empty:
+                # Group by date and similar time window
+                remaining['TimeGroupKey'] = remaining.apply(
+                    lambda x: (
+                        format_date(x.get('ServiceDate', '')),
+                        # Group by hour (e.g., 08:10 and 08:20 both become "08")
+                        x['CleanPickupTime'].split(':')[0] if ':' in x['CleanPickupTime'] else '',
+                        # Normalize service name for grouping
+                        normalize_service_name(x.get('ServiceName', ''))
+                    ),
+                    axis=1
+                )
+                
+                for time_key, time_group in remaining.groupby('TimeGroupKey'):
+                    if len(time_group) > 1:
+                        # Group by similar pickup time (within 30 minutes)
+                        time_groups = group_by_time_window(time_group, time_window_minutes=30)
+                        for group in time_groups:
+                            if len(group) > 1:
+                                group_df = pd.DataFrame(group)
+                                process_sharing_group(group_df, grouped_records)
+                            else:
+                                # Single passenger in time window
+                                row = group[0]
+                                grouped_records.append({
+                                    'type': 'individual',
+                                    'data': row,
+                                    'row_index': row.name if hasattr(row, 'name') else None
+                                })
+                    else:
+                        # Single passenger
+                        row = time_group.iloc[0]
+                        grouped_records.append({
+                            'type': 'individual',
+                            'data': row.to_dict(),
+                            'row_index': row.name
+                        })
+    
+    return grouped_records
+
+def normalize_service_name(service_name: str) -> str:
+    """Normalize service name for grouping (remove variations)."""
+    if not service_name:
+        return ""
+    
+    service = str(service_name).upper()
+    
+    # Remove common prefixes/suffixes
+    service = re.sub(r'^\s*(NO\s+KIDDING\s*)?', '', service, flags=re.IGNORECASE)
+    service = re.sub(r'\s*(XRQT|TOUR|PACKAGE|WITH\s+LUNCH).*$', '', service, flags=re.IGNORECASE)
+    
+    # Keep only alphanumeric characters
+    service = re.sub(r'[^A-Z0-9\s]', '', service)
+    
+    return service.strip()
+
+def group_by_time_window(df_group, time_window_minutes=30):
+    """
+    Group rows by time windows.
+    """
+    if len(df_group) <= 1:
+        return [df_group.to_dict('records')]
+    
+    # Convert to list of rows
+    rows = df_group.to_dict('records')
+    
+    # Sort by pickup time
+    rows.sort(key=lambda x: time_to_minutes(x.get('PickupTime', '')))
+    
+    groups = []
+    current_group = []
+    
+    for row in rows:
+        if not current_group:
+            current_group.append(row)
+        else:
+            last_time = time_to_minutes(current_group[-1].get('PickupTime', ''))
+            current_time = time_to_minutes(row.get('PickupTime', ''))
+            
+            if abs(current_time - last_time) <= time_window_minutes:
+                current_group.append(row)
+            else:
+                groups.append(current_group)
+                current_group = [row]
+    
+    if current_group:
+        groups.append(current_group)
+    
+    return groups
+
+def time_to_minutes(time_str: str) -> int:
+    """Convert HH:MM time string to minutes."""
+    if not time_str or ':' not in time_str:
+        return 0
+    
+    try:
+        hours, minutes = time_str.split(':')[:2]
+        return int(hours) * 60 + int(minutes[:2])
+    except:
+        return 0
+
+def process_sharing_group(group_df, grouped_records):
+    """Helper function to process a sharing group."""
+    group_passengers = []
+    
+    for _, row in group_df.iterrows():
+        row_dict = row.to_dict()
+        
+        passenger_info = {
+            'pnr': str(row.get('PNR', '')).strip(),
+            'leg_id': str(row.get('LegId', '')).strip(),
+            'guest_name': clean_name(row.get('GuestName', '')),
+            'whatsapp_no': clean_phone_number(row.get('WhatsappNo', '')),
+            'alternate_no': clean_phone_number(row.get('AlternateNumber', '')),
+            'adult': int(row.get('Adult', 0)) if pd.notna(row.get('Adult')) else 0,
+            'child': int(row.get('Child', 0)) if pd.notna(row.get('Child')) else 0,
+            'infant': int(row.get('Infant', 0)) if pd.notna(row.get('Infant')) else 0,
+            'transfer_from': str(row.get('TransferFrom', '')).strip(),
+            'transfer_to': str(row.get('TransferTo', '')).strip(),
+            'service_name': str(row.get('ServiceName', '')).strip(),
+            'tour_option_name': str(row.get('TourOptionName', '')).strip(),
+            'pickup_time': clean_time(row.get('PickupTime', '')),
+            'row_index': row.name if hasattr(row, 'name') else _,
+            'row_data': row_dict  # Store the complete row data
+        }
+        group_passengers.append(passenger_info)
+    
+    # Get common data from first row in group
+    first_row = group_df.iloc[0]
+    group_data = {
+        'type': 'shared',
+        'passengers': group_passengers,
+        'common_data': {
+            'service_date': format_date(first_row.get('ServiceDate', '')),
+            'service_type': str(first_row.get('ServiceType', '')).strip(),
+            'vehicle_name': str(first_row.get('VehicleName', '')).strip(),
+            'driver_name': str(first_row.get('Driver Name', '')).strip(),
+            'driver_number': str(first_row.get('Driver Number', '')).strip(),
+            'vehicle_number': str(first_row.get('Vehicle Number', '')).strip()
+        }
+    }
+    grouped_records.append(group_data)
+
+def clean_time(time_val):
+    """Clean and format time."""
+    if pd.isna(time_val):
+        return ""
+    time_str = str(time_val).strip()
+    # Remove seconds if present
+    if ':' in time_str:
+        parts = time_str.split(':')
+        if len(parts) >= 2:
+            return f"{parts[0].zfill(2)}:{parts[1][:2].zfill(2)}"
+    return time_str
+
+def create_shared_card_text(group_data: Dict[str, Any]) -> str:
+    """
+    Create formatted text for shared tours with COMPLETE info for EACH passenger.
+    """
+    passengers = group_data['passengers']
+    common = group_data['common_data']
+    
+    lines = []
+    
+    # For each passenger in the group
+    for i, passenger in enumerate(passengers):
+        # Get individual passenger's row data
+        row_data = passenger.get('row_data', {})  # We need to store this in grouping
+        
+        # Passenger header (TBZ PNR LegId)
+        lines.append(f"TBZ {passenger['pnr']} {passenger['leg_id']}")
+        
+        # Date (only for first passenger to avoid repetition)
+        if i == 0 and common['service_date']:
+            lines.append(common['service_date'])
+        elif i > 0 and common['service_date']:
+            # For subsequent passengers, we can skip the date or leave blank
+            pass
+        
+        # Guest name with PAX count
+        adult = passenger['adult']
+        child = passenger['child']
+        infant = passenger['infant']
+        
+        # Format PAX exactly as per requirements
+        if child > 0 or infant > 0:
+            if child > 0 and infant > 0:
+                pax_str = f"{adult}+{child}+{infant}PAX"
+            elif child > 0:
+                pax_str = f"{adult}+{child}PAX"
+            elif infant > 0:
+                pax_str = f"{adult}+{infant}PAX"
+        else:
+            pax_str = f"{adult}PAX"
+        
+        lines.append(f"{passenger['guest_name']} -- {pax_str}")
+        
+        # Phone numbers
+        phones = []
+        if passenger['whatsapp_no']:
+            phones.append(passenger['whatsapp_no'])
+        if passenger['alternate_no'] and passenger['alternate_no'] not in ['+91 1111111111', '+91 999999999', '']:
+            phones.append(passenger['alternate_no'])
+        
+        for phone in phones:
+            lines.append(phone)
+        
+        # FROM location (each passenger may have different pickup)
+        if passenger['transfer_from']:
+            lines.append(f"FROM : {passenger['transfer_from']}")
+        
+        # TO location - CRITICAL CHANGE: Get individual TO location
+        # Try TransferTo first, then fall back to service_name
+        transfer_to = passenger.get('transfer_to', '')
+        if not transfer_to and row_data:
+            transfer_to = str(row_data.get('TransferTo', '')).strip()
+        if not transfer_to:
+            # Fall back to service name
+            transfer_to = common.get('service_name', '')
+        
+        if transfer_to:
+            lines.append(f"TO   : {transfer_to}")
+        
+        # Service Name - CRITICAL: Show for EACH passenger
+        service_name = passenger.get('service_name', '')
+        if not service_name and row_data:
+            service_name = str(row_data.get('ServiceName', '')).strip()
+        if not service_name:
+            service_name = common.get('service_name', '')
+        
+        if service_name:
+            # Clean service text
+            service_name = re.sub(r'<[^>]+>', '', service_name)
+            service_name = ' '.join(service_name.split())
+            lines.append(f"Service Name : {service_name}")
+        
+        # Pickup Time - CRITICAL: Show for EACH passenger if available
+        pickup_time = passenger.get('pickup_time', '')
+        if not pickup_time and row_data:
+            pickup_time_raw = row_data.get('PickupTime', '')
+            if pd.notna(pickup_time_raw):
+                pickup_time = str(pickup_time_raw).strip()
+                # Format time properly
+                if ':' in pickup_time:
+                    parts = pickup_time.split(':')
+                    if len(parts) >= 2:
+                        hours = parts[0].zfill(2)
+                        minutes = parts[1][:2].zfill(2)
+                        pickup_time = f"{hours}:{minutes}"
+        
+        if pickup_time and pickup_time not in ['', '00:00', '0:00']:
+            lines.append(f"PICK UP TIME {pickup_time}")
+        elif common['pickup_time'] and i == 0:  # Fallback for first passenger
+            lines.append(f"PICK UP TIME {common['pickup_time']}")
+        
+        # Flight Number - CRITICAL: Show for EACH passenger if available
+        flight_no = ''
+        if row_data:
+            flight_no_raw = row_data.get('FlightNo', '')
+            if pd.notna(flight_no_raw):
+                flight_no = clean_flight_number(str(flight_no_raw))
+        
+        if flight_no:
+            lines.append(f"FLIGHT NUMBER : {flight_no}")
+        
+        # Add empty line between passengers (except after last one)
+        if i < len(passengers) - 1:
+            lines.append("")
+    
+    # Add empty line before service type
+    lines.append("")
+    
+    # Service Type
+    if common['service_type']:
+        lines.append(common['service_type'])
+    
+    # Driver and vehicle info (ONLY ONCE at the end)
+    # Vehicle name first
+    if common['vehicle_name'] and common['vehicle_name'].strip() not in ['', '-', 'N/A', 'UNKNOWN_VEHICLE']:
+        lines.append(common['vehicle_name'])
+    
+    # Driver name
+    if common['driver_name'] and common['driver_name'].strip() not in ['', '-', 'N/A', 'UNKNOWN_DRIVER']:
+        lines.append(common['driver_name'])
+    
+    # Driver number
+    if common['driver_number'] and common['driver_number'].strip() not in ['', '-', 'N/A']:
+        lines.append(common['driver_number'])
+    
+    # Vehicle number
+    if common['vehicle_number'] and common['vehicle_number'].strip() not in ['', '-', 'N/A', 'UNKNOWN_VEHICLE_NUM']:
+        lines.append(common['vehicle_number'])
+    
+    # Add divider
+    lines.append("")
+    lines.append("=" * 48)
+    
+    return "\n".join(lines)
 
 def create_card_text(row: Dict[str, Any]) -> str:
     """Create formatted text for a single card in EXACT format as per requirements."""
@@ -455,15 +865,15 @@ def create_card_text(row: Dict[str, Any]) -> str:
         pickup_time = ""
     else:
         pickup_time = str(pickup_time_raw).strip()
-        # Handle Excel time format
+        # Handle Excel time format and remove seconds
         if ':' not in pickup_time and len(pickup_time) == 4 and pickup_time.isdigit():
             pickup_time = f"{pickup_time[:2]}:{pickup_time[2:]}"
         elif ':' in pickup_time:
-            # Ensure proper HH:MM format
+            # Ensure proper HH:MM format (no seconds)
             parts = pickup_time.split(':')
             if len(parts) >= 2:
                 hours = parts[0].zfill(2)
-                minutes = parts[1][:2].zfill(2)
+                minutes = parts[1][:2].zfill(2)  # Only take first 2 digits
                 pickup_time = f"{hours}:{minutes}"
     
     flight_no = clean_flight_number(row['FlightNo']) if 'FlightNo' in row else ""
@@ -537,6 +947,9 @@ def create_card_text(row: Dict[str, Any]) -> str:
     if service_type:
         lines.append(service_type)
 
+    if vehicle_name and vehicle_name not in ['', '-', 'N/A']:
+        lines.append(vehicle_name)
+
     # Driver block (fixed order)
     if driver_name and driver_name not in ['', '-', 'N/A']:
         lines.append(driver_name)
@@ -547,8 +960,7 @@ def create_card_text(row: Dict[str, Any]) -> str:
     if vehicle_number and vehicle_number not in ['', '-', 'N/A']:
         lines.append(vehicle_number)
 
-    if vehicle_name and vehicle_name not in ['', '-', 'N/A']:
-        lines.append(vehicle_name)
+    
 
 
         
@@ -557,6 +969,46 @@ def create_card_text(row: Dict[str, Any]) -> str:
     lines.append("=" * 48)
     
     return "\n".join(lines)
+
+
+def should_group_passengers(row1, row2):
+    """Determine if two passengers should be grouped."""
+    # Same date
+    if format_date(row1.get('ServiceDate')) != format_date(row2.get('ServiceDate')):
+        return False
+    
+    # Same or similar service name
+    service1 = str(row1.get('ServiceName', '')).strip()[:20]
+    service2 = str(row2.get('ServiceName', '')).strip()[:20]
+    if service1 != service2:
+        return False
+    
+    # Same or similar pickup time (within 30 minutes)
+    time1 = clean_time(row1.get('PickupTime', ''))
+    time2 = clean_time(row2.get('PickupTime', ''))
+    if not are_times_similar(time1, time2, max_diff_minutes=30):
+        return False
+    
+    # Both marked as Sharing
+    if (row1.get('ServiceType', '').strip().upper() != 'SHARING' or 
+        row2.get('ServiceType', '').strip().upper() != 'SHARING'):
+        return False
+    
+    return True
+
+def are_times_similar(time1, time2, max_diff_minutes=30):
+    """Check if two times are within specified minutes."""
+    if not time1 or not time2:
+        return False
+    
+    def to_minutes(t):
+        try:
+            h, m = t.split(':')[:2]
+            return int(h) * 60 + int(m[:2])
+        except:
+            return 0
+    
+    return abs(to_minutes(time1) - to_minutes(time2)) <= max_diff_minutes
 
 def html_preserve_text(text: str) -> str:
     return (
@@ -722,72 +1174,87 @@ def create_metric_card(label: str, value, icon: str = "📊"):
     </div>
     """
 
-def display_metrics(df: pd.DataFrame):
-    """Display metrics about the data."""
+def display_metrics(grouped_records: List[Dict[str, Any]]):
+    """Display metrics about the data considering grouped records."""
+    if not grouped_records:
+        return
+    
+    total_cards = len(grouped_records)
+    
+    # Count individual vs shared
+    individual_count = sum(1 for r in grouped_records if r['type'] == 'individual')
+    shared_count = sum(1 for r in grouped_records if r['type'] == 'shared')
+    
+    # Count total passengers
+    total_passengers = 0
+    for record in grouped_records:
+        if record['type'] == 'individual':
+            total_passengers += 1
+        else:
+            total_passengers += len(record['passengers'])
+    
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        total_records = len(df)
-        st.markdown(create_metric_card("Total Records", total_records, "📋"), unsafe_allow_html=True)
+        st.markdown(create_metric_card("Total Cards", total_cards, "📋"), unsafe_allow_html=True)
     
     with col2:
-        unique_pnr = df['PNR'].nunique() if 'PNR' in df.columns else 0
-        st.markdown(create_metric_card("Unique PNRs", unique_pnr, "🔑"), unsafe_allow_html=True)
+        st.markdown(create_metric_card("Total Passengers", total_passengers, "👥"), unsafe_allow_html=True)
     
     with col3:
-        private_count = len(df[df['ServiceType'] == 'Private']) if 'ServiceType' in df.columns else 0
-        st.markdown(create_metric_card("Private", private_count, "🚗"), unsafe_allow_html=True)
+        st.markdown(create_metric_card("Individual", individual_count, "🚗"), unsafe_allow_html=True)
     
     with col4:
-        sharing_count = len(df[df['ServiceType'] == 'Sharing']) if 'ServiceType' in df.columns else 0
-        st.markdown(create_metric_card("Sharing", sharing_count, "👥"), unsafe_allow_html=True)
+        st.markdown(create_metric_card("Shared Groups", shared_count, "👥"), unsafe_allow_html=True)
 
 
-def display_cards(formatted_cards: List[str], filtered_indices: List[int]):
+def display_cards(formatted_cards: List[str], grouped_records: List[Dict[str, Any]]):
     """Display formatted cards with copy buttons."""
     if not formatted_cards:
         st.warning("No data to display. Please upload and process a file first.")
         return
     
-    
-
     # Create tabs for different views
-    tab1, tab2 = st.tabs(["📋 Formatted Cards", "📊 Raw Data Preview"])
+    tab1, tab2 = st.tabs(["📋 Formatted Cards", "📊 Grouped Data Preview"])
     
     with tab1:
         # Display cards with copy buttons
         for i, card_text in enumerate(formatted_cards):
             if i < len(formatted_cards):
-                card_number = filtered_indices[i] + 1 if i < len(filtered_indices) else i + 1
+                # Determine card type for badge
+                card_type = grouped_records[i]['type'] if i < len(grouped_records) else 'individual'
+                badge_color = "#4a6fa5" if card_type == 'individual' else "#10b981"
+                
                 card_html = f"""
                 <div class="card-container">
-                    <div class="card-badge">#{i + 1}</div>
+                    <div class="card-badge" style="background: {badge_color};">#{i + 1}</div>
                     <div class="data-card">{html_preserve_text(card_text)}</div>
                 </div>
                 """
-
+                
                 st.markdown(card_html, unsafe_allow_html=True)
-
     
     with tab2:
         if st.session_state.df is not None:
-            # Show filtered data preview
-            filtered_df = st.session_state.df
-            if len(filtered_indices) < len(filtered_df):
-                filtered_df = filtered_df.iloc[filtered_indices]
+            # Show grouping information
+            st.subheader("Grouping Summary")
             
-            # Show important columns
-            important_cols = ['PNR', 'LegId', 'GuestName', 'ServiceType', 'ServiceDate', 
-                            'TransferFrom', 'TransferTo', 'Adult', 'Child', 'Infant']
+            group_info = []
+            for i, record in enumerate(grouped_records):
+                if record['type'] == 'shared':
+                    group_info.append({
+                        'Card #': i + 1,
+                        'Type': 'Shared',
+                        'Passengers': len(record['passengers']),
+                        'Vehicle': record['common_data'].get('vehicle_name', 'N/A'),
+                        'Driver': record['common_data'].get('driver_name', 'N/A'),
+                        'Pickup Time': record['common_data'].get('pickup_time', 'N/A')
+                    })
             
-            available_cols = [col for col in important_cols if col in filtered_df.columns]
-            
-            if available_cols:
-                preview_df = filtered_df[available_cols].head(20)
-                st.dataframe(preview_df, use_container_width=True)
-                st.caption(f"Showing first 20 of {len(filtered_df)} records")
+            if group_info:
+                st.dataframe(pd.DataFrame(group_info), use_container_width=True)
             else:
-                st.warning("No important columns found in the data")
+                st.info("No shared groups found in the data")
 
 def export_data(formatted_cards: List[str]):
     """Provide export options."""
@@ -886,32 +1353,39 @@ def main():
                     if df is not None:
                         st.session_state.df = df
                         
-                        # Format all cards
+                        # NEW: Group shared services
+                        grouped_records = group_shared_services(df)
+                        
+                        # Format cards based on type
                         formatted_cards = []
-                        for idx, row in df.iterrows():
-                            card_text = create_card_text(row.to_dict())
+                        for record in grouped_records:
+                            if record['type'] == 'individual':
+                                card_text = create_card_text(record['data'])
+                            else:  # shared
+                                card_text = create_shared_card_text(record)
                             formatted_cards.append(card_text)
                         
                         st.session_state.formatted_cards = formatted_cards
+                        st.session_state.grouped_records = grouped_records  # Store for reference
                         st.session_state.processing_done = True
                         st.success("✅ Data processed successfully!")
                         st.rerun()
     
-    # Main content area
+    # In main() function, find where display_metrics is called:
     if st.session_state.df is not None and st.session_state.formatted_cards:
-        df = st.session_state.df
-        
-        # Display metrics
+        # Display metrics - pass grouped_records instead of df
         st.markdown("### 📊 Overview")
-        display_metrics(df)
+        if 'grouped_records' in st.session_state:
+            display_metrics(st.session_state.grouped_records)
         
         st.markdown('<div class="divider-line"></div>', unsafe_allow_html=True)
-
-    st.markdown("### 📋 Formatted Cards")
-    display_cards(
-    st.session_state.formatted_cards,
-    list(range(len(st.session_state.formatted_cards)))
-    )
+        
+        # Display cards - pass grouped_records
+        st.markdown("### 📋 Formatted Cards")
+        display_cards(
+            st.session_state.formatted_cards,
+            st.session_state.grouped_records
+        )
 
         # Sidebar export options
     if st.session_state.formatted_cards:
