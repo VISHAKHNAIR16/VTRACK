@@ -588,31 +588,52 @@ def group_shared_services(df: pd.DataFrame) -> List[Dict[str, Any]]:
                     if len(time_group) > 1:
                         # Group by similar pickup time (within 30 minutes)
                         time_groups = group_by_time_window(time_group, time_window_minutes=30)
-                        for group in time_groups:
+                        for group in time_groups:                            
+                            # Single passenger in time window
                             if len(group) > 1:
                                 group_df = pd.DataFrame(group)
                                 process_sharing_group(group_df, grouped_records)
                             else:
                                 # Single passenger in time window
                                 row = group[0]
+                                # FIX: Convert row to dictionary if it's a Series
+                                if hasattr(row, 'to_dict'):
+                                    row_data = row.to_dict()
+                                else:
+                                    row_data = row
+                                
+                                # FIX: Get row index or use a default value
+                                row_name = row.name if hasattr(row, 'name') else 999999
                                 grouped_records.append({
                                     'type': 'individual',
-                                    'data': row,
-                                    'row_index': row.name if hasattr(row, 'name') else None,
-                                    'sort_index': row.name if hasattr(row, 'name') else None
+                                    'data': row_data,  # Now it's definitely a dict
+                                    'row_index': row_name,
+                                    'sort_index': row_name  # Use actual value, not None
                                 })
                     else:
                         # Single passenger
                         row = time_group.iloc[0]
+                        # FIX: Get row index or use a default value
+                        row_index = row.name if hasattr(row, 'name') else 999999
                         grouped_records.append({
                             'type': 'individual',
-                            'data': row.to_dict(),
-                            'row_index': row.name,
-                            'sort_index': row.name
+                            'data': row.to_dict(),  # Convert Series to dict
+                            'row_index': row_index,
+                            'sort_index': row_index  # Use actual value, not None
                         })
     
     # Finally, sort all records by their original index to maintain DataFrame order
-    grouped_records.sort(key=lambda x: x.get('sort_index', 999999))
+    # FIX: Handle None values properly in sort key
+    def get_sort_key(x):
+        sort_val = x.get('sort_index')
+        if sort_val is None:
+            return 999999
+        try:
+            return int(sort_val)
+        except (ValueError, TypeError):
+            return 999999
+    
+    grouped_records.sort(key=get_sort_key)
     
     return grouped_records
 
