@@ -36,37 +36,41 @@ def normalize_service_name(service_name: str) -> str:
 
 def group_by_time_window(df_group, time_window_minutes=45):
     """
-    Group rows by time windows.
+    Group rows by time windows (true sliding: any row in group <= window).
     """
     if len(df_group) <= 1:
         return [df_group.to_dict('records')]
     
-    # Convert to list of rows
     rows = df_group.to_dict('records')
-    
-    # Sort by pickup time
     rows.sort(key=lambda x: time_to_minutes(x.get('PickupTime', '')))
     
     groups = []
     current_group = []
     
     for row in rows:
+        current_time = time_to_minutes(row.get('PickupTime', ''))
+        
         if not current_group:
             current_group.append(row)
+            continue
+        
+        # Key fix: check vs ALL in current_group
+        can_join = any(
+            abs(current_time - time_to_minutes(prev.get('PickupTime', ''))) <= time_window_minutes
+            for prev in current_group
+        )
+        
+        if can_join:
+            current_group.append(row)
         else:
-            last_time = time_to_minutes(current_group[-1].get('PickupTime', ''))
-            current_time = time_to_minutes(row.get('PickupTime', ''))
-            
-            if abs(current_time - last_time) <= time_window_minutes:
-                current_group.append(row)
-            else:
-                groups.append(current_group)
-                current_group = [row]
+            groups.append(current_group)
+            current_group = [row]
     
     if current_group:
         groups.append(current_group)
     
     return groups
+
 
 
 def process_sharing_group(group_df, grouped_records):
@@ -142,6 +146,7 @@ def group_shared_services(df: pd.DataFrame) -> List[Dict[str, Any]]:
     """
     Group passengers who share the same vehicle/driver for tours.
     Enhanced for handling data from merged cells.
+    FIXED: Added time_window grouping instead of hour-only binning.
     """
     grouped_records = []
     
@@ -183,96 +188,98 @@ def group_shared_services(df: pd.DataFrame) -> List[Dict[str, Any]]:
             'sort_index': row['OriginalIndex'] if 'OriginalIndex' in row else index
         })
     
-    # STEP 2: Group sharing services
+    # STEP 2: Group sharing services - FIXED with time window
     if not sharing_df.empty:
-        # Group by vehicle/driver combo - now all rows should have the info due to forward-filling
+        # FIRST: Group by vehicle/driver/service (REMOVED hour binning)
         grouping_keys = []
-        
-        # Create a unique group key based on vehicle/driver info AND service/time
         for _, row in sharing_df.iterrows():
-            # Use vehicle info if available
             vehicle_key = (
                 format_date(row.get('ServiceDate', '')),
                 row.get('CleanVehicalName', ''),
                 row.get('CleanDriver Name', ''),
                 row.get('CleanDriver Number', ''),
                 row.get('CleanVehicle Number', ''),
-                # Also include service name and time for better grouping
-                normalize_service_name(row.get('ServiceName', '')),
-                row.get('CleanPickupTime', '').split(':')[0] if ':' in row.get('CleanPickupTime', '') else ''
+                normalize_service_name(row.get('ServiceName', ''))
+                # REMOVED: row.get('CleanPickupTime', '').split(':')[0] 
             )
             grouping_keys.append(vehicle_key)
         
         sharing_df['GroupKey'] = grouping_keys
         
-        # Process each group
+        # Process each vehicle/service group
         for group_key, group_df in sharing_df.groupby('GroupKey'):
             group_df = group_df.sort_values('OriginalIndex')
             
             if len(group_df) > 0:
-                # Check if this group has valid vehicle info
                 first_row = group_df.iloc[0]
                 has_vehicle_info = (
                     first_row['CleanVehicalName'] not in ['', '-', 'N/A'] and
                     first_row['CleanDriver Name'] not in ['', '-', 'N/A']
                 )
                 
-                if len(group_df) > 1:
-                    # Multiple passengers in this group
-                    group_passengers = []
+                # FIXED: Apply time_window grouping WITHIN each vehicle group
+                time_subgroups = group_by_time_window(group_df.reset_index(drop=True), time_window_minutes=45)
+                
+                for subgroup_df_list in time_subgroups:
+                    subgroup_df = pd.DataFrame(subgroup_df_list)
                     
-                    for _, row in group_df.iterrows():
-                        passenger_info = {
-                            'pnr': str(row.get('PNR', '')).strip(),
-                            'leg_id': str(row.get('LegId', '')).strip(),
-                            'guest_name': clean_name(row.get('GuestName', '')),
-                            'whatsapp_no': clean_phone_number(row.get('WhatsappNo', '')),
-                            'alternate_no': clean_phone_number(row.get('AlternateNumber', '')),
-                            'adult': int(row.get('Adult', 0)) if pd.notna(row.get('Adult')) else 0,
-                            'child': int(row.get('Child', 0)) if pd.notna(row.get('Child')) else 0,
-                            'infant': int(row.get('Infant', 0)) if pd.notna(row.get('Infant')) else 0,
-                            'transfer_from': str(row.get('TransferFrom', '')).strip(),
-                            'transfer_to': str(row.get('TransferTo', '')).strip(),
-                            'service_name': str(row.get('ServiceName', '')).strip(),
-                            'tour_option_name': str(row.get('TourOptionName', '')).strip(),
-                            'pickup_time': clean_time(row.get('PickupTime', '')),
-                            'row_index': row.name if hasattr(row, 'name') else _,
-                            'row_data': row.to_dict()
+                    if len(subgroup_df) > 1:
+                        # Multiple passengers in time window -> shared group
+                        group_passengers = []
+                        
+                        for _, row in subgroup_df.iterrows():
+                            passenger_info = {
+                                'pnr': str(row.get('PNR', '')).strip(),
+                                'leg_id': str(row.get('LegId', '')).strip(),
+                                'guest_name': clean_name(row.get('GuestName', '')),
+                                'whatsapp_no': clean_phone_number(row.get('WhatsappNo', '')),
+                                'alternate_no': clean_phone_number(row.get('AlternateNumber', '')),
+                                'adult': int(row.get('Adult', 0)) if pd.notna(row.get('Adult')) else 0,
+                                'child': int(row.get('Child', 0)) if pd.notna(row.get('Child')) else 0,
+                                'infant': int(row.get('Infant', 0)) if pd.notna(row.get('Infant')) else 0,
+                                'transfer_from': str(row.get('TransferFrom', '')).strip(),
+                                'transfer_to': str(row.get('TransferTo', '')).strip(),
+                                'service_name': str(row.get('ServiceName', '')).strip(),
+                                'tour_option_name': str(row.get('TourOptionName', '')).strip(),
+                                'pickup_time': clean_time(row.get('PickupTime', '')),
+                                'row_index': row.name if hasattr(row, 'name') else _,
+                                'row_data': row.to_dict()
+                            }
+                            group_passengers.append(passenger_info)
+                        
+                        # Get common data from first row
+                        group_data = {
+                            'type': 'shared',
+                            'passengers': group_passengers,
+                            'common_data': {
+                                'service_date': format_date(first_row.get('ServiceDate', '')),
+                                'service_type': str(first_row.get('ServiceType', '')).strip(),
+                                'vehicle_name': first_row['CleanVehicalName'],
+                                'driver_name': first_row['CleanDriver Name'],
+                                'driver_number': first_row['CleanDriver Number'],
+                                'vehicle_number': first_row['CleanVehicle Number'],
+                                'service_name': str(first_row.get('ServiceName', '')).strip(),
+                                'pickup_time': clean_time(first_row.get('PickupTime', '')),
+                                'group_size': len(subgroup_df)
+                            },
+                            'sort_index': subgroup_df['OriginalIndex'].min()
                         }
-                        group_passengers.append(passenger_info)
-                    
-                    # Get common data from first row (should have all vehicle info due to forward-filling)
-                    group_data = {
-                        'type': 'shared',
-                        'passengers': group_passengers,
-                        'common_data': {
-                            'service_date': format_date(first_row.get('ServiceDate', '')),
-                            'service_type': str(first_row.get('ServiceType', '')).strip(),
-                            'vehicle_name': first_row['CleanVehicalName'],
-                            'driver_name': first_row['CleanDriver Name'],
-                            'driver_number': first_row['CleanDriver Number'],
-                            'vehicle_number': first_row['CleanVehicle Number'],
-                            'service_name': str(first_row.get('ServiceName', '')).strip(),
-                            'pickup_time': clean_time(first_row.get('PickupTime', '')),
-                            'group_size': len(group_df)
-                        },
-                        'sort_index': group_df['OriginalIndex'].min()
-                    }
-                    grouped_records.append(group_data)
-                else:
-                    # Single passenger in group
-                    row = group_df.iloc[0]
-                    grouped_records.append({
-                        'type': 'individual',
-                        'data': row.to_dict(),
-                        'row_index': row.name if hasattr(row, 'name') else index,
-                        'sort_index': row['OriginalIndex'] if 'OriginalIndex' in row else index
-                    })
+                        grouped_records.append(group_data)
+                    else:
+                        # Single passenger in time window
+                        row = subgroup_df.iloc[0]
+                        grouped_records.append({
+                            'type': 'individual',
+                            'data': row.to_dict(),
+                            'row_index': row.name if hasattr(row, 'name') else index,
+                            'sort_index': row['OriginalIndex'] if 'OriginalIndex' in row else index
+                        })
     
     # Sort all records by their original order
     grouped_records.sort(key=lambda x: x.get('sort_index', 999999))
     
     return grouped_records
+
 
 def process_excel_file(uploaded_file) -> Optional[pd.DataFrame]:
     """
