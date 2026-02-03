@@ -14,7 +14,7 @@ warnings.filterwarnings('ignore')
 
 # Set page configuration
 st.set_page_config(
-    page_title="VTRACK -- By Vayoaura",
+    page_title="Divine Tours & Travels",
     page_icon="📋",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -171,7 +171,7 @@ def main():
     # App header
     st.markdown("""
     <div class="main-header">
-        <h1 style="margin: 0; font-size: 2rem;">📋 Welcome To VTrack</h1>
+        <h1 style="margin: 0; font-size: 2rem;">📋 Welcome To VTrack By Divine Tours & Travels</h1>
         <p style="margin: 5px 0 0 0; opacity: 0.9; font-size: 1rem;">
         Convert Excel travel booking data to operational text format with exact spacing
         </p>
